@@ -29,4 +29,4 @@ module load CUDA
 module load cuDNN
 module load miniconda
 conda activate envs_LARA
-python exp_grokk.py
+python src/exp_grokk.py
