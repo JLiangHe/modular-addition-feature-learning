@@ -1,2 +1,11 @@
-saved_models/
-wandb/
+src/wandb/
+src/notebooks/simulate_dynamics.ipynb
+src/notebooks/empirical_insight_grok.ipynb
+
+# Claude AI files
+.claude/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class

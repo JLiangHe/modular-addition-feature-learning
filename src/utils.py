@@ -1,5 +1,6 @@
 import yaml, os, time, wandb, random
 import numpy as np
+import torch
 import torch.optim as optim
 import torch.nn.functional as F
 
@@ -7,11 +8,27 @@ from dataclasses import dataclass
 from collections import defaultdict
 from typing import Optional
 
-from model_base import *
-#from model_base_simple import *
+try:
+    # For running from within src/ directory (script execution)
+    from mechanism_base import *
+    from model_base import EmbedMLP
+except ImportError:
+    # For running from parent directory (Jupyter notebooks)
+    from src.mechanism_base import *
+    from src.model_base import EmbedMLP
 
 
 ########## Configuration Managers ##########
+def set_all_seeds(seed):
+    """Set all random seeds for reproducibility"""
+    random.seed(seed)                          # Python random module
+    np.random.seed(seed)                       # NumPy random
+    torch.manual_seed(seed)                    # PyTorch CPU random
+    torch.cuda.manual_seed(seed)               # PyTorch GPU random (current GPU)
+    torch.cuda.manual_seed_all(seed)           # PyTorch GPU random (all GPUs)
+    torch.backends.cudnn.deterministic = True  # Make CuDNN deterministic
+    torch.backends.cudnn.benchmark = False     # Disable CuDNN benchmarking for reproducibility
+    
 def read_config():
     current_dir = os.path.dirname(__file__)
     config_path = os.path.join(current_dir, "configs.yaml")
@@ -29,12 +46,46 @@ class Config:
         if not config:
             raise ValueError("Configuration dictionary cannot be None or empty.")
         
-        # Load configurations from the dictionary and set them as attributes
-        for key, value in config.items():
-            setattr(self, key, value)
+        # Load configurations from the nested dictionary structure and flatten them
+        self._flatten_config(config)
+        
+        # Ensure numeric types are properly converted
+        if hasattr(self, 'lr') and isinstance(self.lr, str):
+            self.lr = float(self.lr)
+        if hasattr(self, 'weight_decay') and isinstance(self.weight_decay, str):
+            self.weight_decay = float(self.weight_decay)
+        if hasattr(self, 'stopping_thresh') and isinstance(self.stopping_thresh, str):
+            self.stopping_thresh = float(self.stopping_thresh)
 
+        # Set d_vocab equal to p if not explicitly specified
+        if not hasattr(self, 'd_vocab') or self.d_vocab is None:
+            self.d_vocab = self.p
+        
+        # Set d_model for one_hot embedding type
+        if not hasattr(self, 'd_model') or self.d_model is None:
+            if hasattr(self, 'embed_type') and self.embed_type == 'one_hot':
+                self.d_model = self.d_vocab
+            else:
+                # For learned embeddings, use a default dimension
+                self.d_model = 128
+        
+        # Set all random seeds for reproducibility
+        if hasattr(self, 'seed'):
+            set_all_seeds(self.seed)
+            print(f"All random seeds set to: {self.seed}")
+        
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(self.device)
+
+    def _flatten_config(self, config_dict, parent_key=''):
+        """Flatten nested configuration dictionary into flat attributes"""
+        for key, value in config_dict.items():
+            if isinstance(value, dict):
+                # Recursively flatten nested dictionaries
+                self._flatten_config(value, parent_key)
+            else:
+                # Set the attribute directly
+                setattr(self, key, value)
 
     # Property to generate a matrix of random answers (used for 'rand' function)
     @property
@@ -93,6 +144,7 @@ def gen_train_test(config: Config):
     '''Generate train and test split'''
     num_to_generate = config.p
     pairs = [(i, j) for i in range(num_to_generate) for j in range(num_to_generate)]
+    # Note: Global seeding already handled in Config.__init__, but keeping for extra safety
     random.seed(config.seed)
     random.shuffle(pairs)
     
@@ -104,235 +156,7 @@ def gen_train_test(config: Config):
     return pairs[:div], pairs[div:]
 
 ########## Training Managers ##########
-class Trainer:
-    '''Trainer class for managing the training process of a model'''
-
-    def __init__(self, config: Config, model: Optional[EmbedMLP] = None) -> None:
-               
-        # Use a given model or initialize a new Transformer model with the provided config
-        self.model = model if model is not None else EmbedMLP(
-                        d_vocab=config.d_vocab,
-                        d_model=config.d_model,
-                        d_mlp=config.d_mlp,
-                        act_type=config.act_type,
-                        use_cache=False
-                    )
-        self.model.to(config.device)  # Move model to specified device (e.g., GPU)
-        if config.optimizer == 'AdamW':
-            self.optimizer = optim.AdamW(
-                self.model.parameters(),
-                lr=config.lr,
-                weight_decay=config.weight_decay,
-                betas=(0.9, 0.98)
-            )
-
-            # Update scheduler with `AdamW` optimizer
-            self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lambda step: min(step / 10, 1))
-        elif config.optimizer == 'SGD':
-            self.optimizer = optim.SGD(
-                self.model.parameters(),
-                lr=config.lr,
-                weight_decay=config.weight_decay  # This applies L2 regularization, equivalent to weight decay in GD
-            )
-
-            # You can keep the scheduler as is, if desired
-            self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lambda step: min(step / 10, 1))
-        
-        # Generate a unique run name for this training session
-        formatted_time = time.strftime("%m%d%H%M", time.localtime())
-        self.run_name = f"p_{config.p}_dmodel_{config.d_model}_dmlp_{config.d_mlp}_act_{config.act_type}_decay_{config.weight_decay}_fractrain_{config.frac_train}_DFT_{formatted_time}"
-        
-        # Initialize experiment logging with wandb (Weights and Biases)
-        wandb.init(project="modular_addition_feature_learning", config=config, name=self.run_name)
-        
-        # Define the directory where model checkpoints will be saved
-        self.save_dir = "saved_models"
-        os.makedirs(os.path.join(self.save_dir, self.run_name), exist_ok=True)
-
-        # Generate training and testing datasets
-        self.train, self.test = gen_train_test(config=config)
-
-        # Save the training and testing datasets
-        train_path = os.path.join(self.save_dir, self.run_name, "train_data.pth")
-        test_path = os.path.join(self.save_dir, self.run_name, "test_data.pth")
-        torch.save(self.train, train_path)
-        torch.save(self.test, test_path)
-        
-        # Dictionary to store metrics (train/test losses, etc.)
-        self.metrics_dictionary = defaultdict(dict)
-        print('training length = ', len(self.train))
-        print('testing length = ', len(self.test))
-        
-        # Lists to store loss values during training
-        self.train_losses = []
-        self.test_losses = []
-        self.grad_norms = []
-        self.param_norms = []
-        self.test_accs = []
-        self.train_accs = []
-        self.config = config
-
-    def save_epoch(self, epoch, save_to_wandb=True, local_save=False):
-        '''Save model and training state at the specified epoch'''
-        save_dict = {
-            'model': self.model.state_dict(),
-            'train_loss': self.train_losses[-1],
-            'test_loss': self.test_losses[-1],
-            'grad_norm': self.grad_norms[-1],
-            'param_norm': self.param_norms[-1],
-            'test_accuracy': self.test_accs[-1],
-            'train_accuracy': self.train_accs[-1],
-            'epoch': epoch,
-        }
-        if save_to_wandb:
-            wandb.log(save_dict)  # Log to wandb
-            config_dict = {
-                k: (str(v) if isinstance(v, torch.device) else v)
-                for k, v in self.config.__dict__.items()
-            }
-            wandb.log(config_dict) 
-            print("Saved epoch to wandb")
-        if self.config.save_models or local_save: 
-            # Save model state to a file
-            save_path = os.path.join(self.save_dir, self.run_name, f"{epoch}.pth")
-            torch.save(save_dict, save_path)
-            print(f"Saved model to {save_path}")
-        self.metrics_dictionary[epoch].update(save_dict)
-
-    def do_a_training_step(self, epoch: int):
-        '''Perform a single training step and return train and test loss'''
-        # Calculate training loss on the training data
-        train_loss = full_loss(config=self.config, model=self.model, data=self.train)
-        
-        # Calculate testing loss on the testing data
-        test_loss = full_loss(config=self.config, model=self.model, data=self.test)
-
-        # Calculate training loss on the training data
-        train_acc = acc(config=self.config, model=self.model, data=self.train)
-        
-        # Calculate testing loss on the testing data
-        test_acc = acc(config=self.config, model=self.model, data=self.test)
-
-        # Append loss values to tracking lists
-        self.train_losses.append(train_loss.item())
-        self.test_losses.append(test_loss.item())
-        self.train_accs.append(train_acc)
-        self.test_accs.append(test_acc)
-        
-        if epoch % 100 == 0:
-            # Log progress every 100 epochs
-            print(f'Epoch {epoch}, train loss {train_loss.item():.4f}, test loss {test_loss.item():.4f}')
-
-        
-        # Backpropagation and optimization step
-        train_loss.backward()  # Compute gradients
-        # Compute gradient norm and parameter norm
-        grad_norm = 0.0
-        param_norm = 0.0
-
-        for param in self.model.parameters():
-            if param.grad is not None:
-                grad_norm += param.grad.norm(2).item()**2  # Sum of squared gradients
-            param_norm += param.norm(2).item()**2  # Sum of squared parameters
-        self.grad_norms.append(grad_norm**0.5)  # L2 norm of gradients
-        self.param_norms.append(param_norm**0.5)  # L2 norm of parameters
-
-        self.optimizer.step()  # Update model parameters
-        self.scheduler.step()  # Update learning rate
-        self.optimizer.zero_grad()  # Clear gradients
-        return train_loss, test_loss
-
-    def initial_save_if_appropriate(self):
-        '''Save initial model state and data if configured to do so'''
-        if self.config.save_models:
-            save_path = os.path.join(self.save_dir, self.run_name, 'init.pth')
-            save_dict = {
-                'model': self.model.state_dict(),
-                'train_data': self.train,
-                'test_data': self.test
-            }
-            torch.save(save_dict, save_path)
-
-    def post_training_save(self, save_optimizer_and_scheduler=True, log_to_wandb=True):
-        '''Save final model state and metrics after training'''
-        save_path = os.path.join(self.save_dir, self.run_name, "final.pth")
-        save_dict = {
-            'model': self.model.state_dict(),
-            'train_loss': self.train_losses[-1],
-            'test_loss': self.test_losses[-1],
-            'train_losses': self.train_losses,
-            'test_losses': self.test_losses,
-            'grad_norms': self.grad_norms,
-            'param_norms': self.param_norms,
-            'epoch': self.config.num_epochs,
-        }
-        if save_optimizer_and_scheduler:
-            # Optionally save optimizer and scheduler states
-            save_dict['optimizer'] = self.optimizer.state_dict()
-            save_dict['scheduler'] = self.scheduler.state_dict()
-        if log_to_wandb:
-            wandb.log(save_dict)
-        torch.save(save_dict, save_path)
-        print(f"Saved model to {save_path}")
-        self.metrics_dictionary[save_dict['epoch']].update(save_dict)
-
-    def take_metrics(self, train, epoch):
-        '''Calculate and log metrics for the current epoch'''
-        with torch.inference_mode():  # Disable gradient calculation for metrics
-            def sum_sq_weights():
-                '''Calculate sum of squared weights (example metric)'''
-                row = []
-                for name, param in self.model.named_parameters():
-                    row.append(param.pow(2).sum().item())
-                return row
-
-            #print('taking metrics')
-
-            # Prepare all possible data points for metric calculations
-            all_data = torch.tensor([(i, j, self.config.p) for i in range(self.config.p) for j in range(self.config.p)]).to(self.config.device)
-            
-            # Calculate frequency-related metrics (customized calculations)
-            key_freqs = calculate_key_freqs(config=self.config, model=self.model, all_data=all_data)
-            logits = self.model(all_data)[:, -1, :-1]
-            fourier_basis = make_fourier_basis(config=self.config)
-            is_train, is_test = self.config.is_train_is_test(train=train)
-            labels = torch.tensor([self.config.fn(i, j) for i, j, _ in all_data]).to(self.config.device)
-
-            # Compile metrics to log
-            metrics = {
-                'epoch': epoch, 
-                'trig_loss': calculate_trig_loss(
-                    config=self.config,
-                    model=self.model,
-                    train=train,
-                    key_freqs=key_freqs,
-                    is_test=is_test,
-                    is_train=is_train,
-                    labels=labels,
-                    logits=logits,
-                    fourier_basis=fourier_basis,
-                    all_data=all_data
-                ),
-                'sum_of_squared_weights': sum_sq_weights(),
-                'excluded_loss': calculate_excluded_loss(
-                    logits=logits,
-                    key_freqs=key_freqs,
-                    fourier_basis=fourier_basis,
-                    is_train=is_train,
-                    config=self.config,
-                    is_test=is_test,
-                    labels=labels
-                ),
-                'coefficients': calculate_coefficients(
-                    p=self.config.p, 
-                    logits=logits, 
-                    fourier_basis=fourier_basis, 
-                    key_freqs=key_freqs, 
-                    device=self.config.device
-                ),
-            }
-            wandb.log(metrics)  # Log metrics to wandb
-            self.metrics_dictionary[epoch].update(metrics)
+# Trainer class has been moved to NNTrainer.py
 
 ########## Loss Definition ##########
 def cross_entropy_high_precision(logits, labels):
@@ -348,6 +172,12 @@ def cross_entropy_high_precision(logits, labels):
 
 def full_loss(config : Config, model: EmbedMLP, data):
     '''Takes the cross entropy loss of the model on the data'''
+    # Convert data to tensor and move to correct device
+    if not isinstance(data, torch.Tensor):
+        data = torch.tensor(data, device=config.device)
+    elif data.device != config.device:
+        data = data.to(config.device)
+    
     # Take the final position only
     logits = model(data)#[:, -1]
     labels = torch.tensor([config.fn(i, j) for i, j in data]).to(config.device)
@@ -360,6 +190,12 @@ def acc_rate(logits, labels):
     return accuracy
 
 def acc(config: Config, model: EmbedMLP, data):
+    # Convert data to tensor and move to correct device
+    if not isinstance(data, torch.Tensor):
+        data = torch.tensor(data, device=config.device)
+    elif data.device != config.device:
+        data = data.to(config.device)
+    
     logits = model(data)
     labels = torch.tensor([config.fn(i, j) for i, j in data]).to(config.device)
     predictions = torch.argmax(logits, dim=1)  # Get predicted class indices

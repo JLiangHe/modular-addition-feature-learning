@@ -6,7 +6,6 @@ import plotly.express as px
 import plotly.io as pio
 import torch.nn as nn
 
-from utils import Config
 from functools import partial     
 
 
@@ -129,7 +128,7 @@ def unflatten_first(tensor, p):
     else: 
         return tensor
 
-def decode_weights(model_load, fourier_basis_unstd):
+def decode_weights(model_load, fourier_basis):
     """
     Decodes the weights using the given model and Fourier basis, and computes the maximum frequency list.
 
@@ -144,8 +143,8 @@ def decode_weights(model_load, fourier_basis_unstd):
             - max_freq_ls (list): List of maximum frequencies derived from W_in_decode.
     """
     # Decode the weights
-    W_in_decode = model_load['mlp.W_in'] @ fourier_basis_unstd.T
-    W_out_decode = model_load['mlp.W_out'].T @ fourier_basis_unstd.T
+    W_in_decode = model_load['mlp.W_in'] @ fourier_basis.T
+    W_out_decode = model_load['mlp.W_out'].T @ fourier_basis.T
 
     # Find the maximum frequency list
     max_ls = torch.argmax(abs(W_in_decode), dim=1)
@@ -167,11 +166,12 @@ def compute_neuron(neuron, max_freq_ls, W_decode):
             - coeff_in_scale (float): Scale coefficient.
             - coeff_in_phi (float): Phase coefficient.
     """
+    p = W_decode.shape[1]
     if max_freq_ls[neuron] != 0:
         # Get the coefficients for the neuron
         neuron_coeff = W_decode[neuron, [max_freq_ls[neuron] * 2 - 1, max_freq_ls[neuron] * 2]]
         # Compute scale and phase
-        coeff_scale = np.sqrt(torch.sum(neuron_coeff.pow(2)).item())
+        coeff_scale = np.sqrt(torch.sum(neuron_coeff.pow(2)).item()) * np.sqrt(2/p)
         coeff_phi = np.arctan2(-neuron_coeff[1].item(), neuron_coeff[0].item())
     else:
         # Default values if max frequency is zero
@@ -182,7 +182,7 @@ def compute_neuron(neuron, max_freq_ls, W_decode):
 
 import torch
 
-def decode_scales_phis(model_load: dict, fourier_basis_unstd: torch.Tensor):
+def decode_scales_phis(model_load: dict, fourier_basis: torch.Tensor):
     """
     Decode W_in into scale & phase for **all** frequencies.
 
@@ -191,8 +191,8 @@ def decode_scales_phis(model_load: dict, fourier_basis_unstd: torch.Tensor):
       phis:   Tensor[n_neurons, K+1]
     """
     # 1) decode W_in
-    W = model_load['mlp.W_in'] @ fourier_basis_unstd.T  # [n_neurons, p]
-    W_out = model_load['mlp.W_out'].T @ fourier_basis_unstd.T  # [n_neurons, p]
+    W = model_load['mlp.W_in'] @ fourier_basis.T  # [n_neurons, p]
+    W_out = model_load['mlp.W_out'].T @ fourier_basis.T  # [n_neurons, p]
 
     # 2) set up
     n_neurons, p = W.shape
@@ -210,7 +210,7 @@ def decode_scales_phis(model_load: dict, fourier_basis_unstd: torch.Tensor):
     for f in range(1, K+1):
         real = W[:, 2*f - 1]
         imag = W[:, 2*f]
-        scales[:, f] = torch.sqrt(real.pow(2) + imag.pow(2))
+        scales[:, f] = np.sqrt(2/p) * torch.sqrt(real.pow(2) + imag.pow(2))
         phis[:,   f] = torch.atan2(-imag, real)
         psis[:,   f] = torch.atan2(-W_out[:, 2*f], W_out[:, 2*f - 1])
 

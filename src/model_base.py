@@ -53,23 +53,37 @@ class HookPoint(nn.Module):
 
 # Embed & Unembed
 class Embed(nn.Module):
-    def __init__(self, d_vocab, d_model):
+    def __init__(self, d_vocab, d_model, embed_type='one_hot'):
         super().__init__()
-        # Weight matrix for embedding, initialized with standard deviation scaled by sqrt(d_model)
-        self.W_E = nn.Parameter(torch.randn(d_model, d_vocab)/np.sqrt(d_model))
         self.d_vocab = d_vocab
+        self.embed_type = embed_type
+        
+        if embed_type == 'learned':
+            # Weight matrix for embedding, initialized with standard deviation scaled by sqrt(d_model)
+            self.W_E = nn.Parameter(torch.randn(d_model, d_vocab)/np.sqrt(d_model))
+        elif embed_type == 'one_hot':
+            # For one-hot embeddings, we don't need learnable parameters
+            self.W_E = None
+        else:
+            raise ValueError(f"Invalid embed_type: {embed_type}. Must be 'one_hot' or 'learned'")
     
     def forward(self, x):
-        # Convert input tokens to embedded vectors using a matrix product
+        # Convert input tokens to embedded vectors
         # Input x is expected to be of shape (batch_size, 2), indexing tokens in the vocabulary
         # Convert input to a tensor if it's not already
         if isinstance(x, list):
-            x = torch.tensor(x, device=self.W_E.device)
+            device = self.W_E.device if self.W_E is not None else 'cpu'
+            x = torch.tensor(x, device=device)
         # Validate shape
         assert x.ndim == 2 and x.shape[1] == 2, f"Expected input shape (batch_size, 2), got {x.shape}"
 
-        embed = F.one_hot(x, num_classes=self.d_vocab).float().sum(dim=1).unsqueeze(1)
-        #embed = torch.einsum('dbp -> bpd', self.W_E[:, x]).sum(dim=1).unsqueeze(1)  # This operation gathers the embeddings for the input tokens      
+        if self.embed_type == 'one_hot':
+            # One-hot embedding: sum the one-hot vectors for the two input tokens
+            embed = F.one_hot(x, num_classes=self.d_vocab).float().sum(dim=1).unsqueeze(1)
+        elif self.embed_type == 'learned':
+            # Learned embedding: use embedding matrix to get vectors and sum them
+            embed = torch.einsum('dbp -> bpd', self.W_E[:, x]).sum(dim=1).unsqueeze(1)
+        
         return embed
 
 class LayerNorm(nn.Module):
@@ -95,52 +109,74 @@ class LayerNorm(nn.Module):
 
 # MLP Layers
 class MLP(nn.Module):
-    def __init__(self, d_model, d_mlp, d_vocab, act_type, model):
+    def __init__(self, d_model, d_mlp, d_vocab, act_type, model, init_type='random', init_scale=0.1):
         super().__init__()
         self.model = model
-        # Input and output weight matrices for the feedforward layer
-        self.W_in = nn.Parameter(0.01 * torch.randn(d_mlp, d_model)/np.sqrt(d_model))
-        #self.b_in = nn.Parameter(torch.zeros(d_mlp))
-        self.W_out = nn.Parameter(0.01 * torch.randn(d_vocab, d_mlp)/np.sqrt(d_model))
-        #self.b_out = nn.Parameter(torch.zeros(d_model))
+        self.init_type = init_type
+        self.init_scale = init_scale
+        
+        # Initialize weights based on init_type
+        if init_type == 'random':
+            # Random initialization
+            self.W_in = nn.Parameter(self.init_scale * torch.randn(d_mlp, d_model)/np.sqrt(d_model))
+            self.W_out = nn.Parameter(self.init_scale * torch.randn(d_vocab, d_mlp)/np.sqrt(d_model))
+        elif init_type == 'single-freq':
+            # Sparse frequency-based initialization
+            freq_num = (d_vocab-1)//2
+            init_freq = decide_frequencies(d_mlp, d_model, freq_num)
+            fourier_basis, _ = get_fourier_basis(d_vocab)
+            
+            self.W_in = nn.Parameter(self.init_scale * np.sqrt(d_vocab/2) * sparse_initialization(d_mlp, d_model, init_freq) @ fourier_basis)
+            self.W_out = nn.Parameter(self.init_scale * np.sqrt(d_vocab/2) * fourier_basis.T @ sparse_initialization(d_mlp, d_model, init_freq).T)
+        else:
+            raise ValueError(f"Invalid init_type:  ini{init_type}. Must be 'random' or 'single-freq'")
+        
+        # Store activation - can be string or function
         self.act_type = act_type
-        # self.ln = LayerNorm(d_mlp, model=self.model)
         self.hook_pre = HookPoint()
         self.hook_post = HookPoint()
-        assert act_type in ['ReLU', 'GeLU', 'Quad', 'Id']
+        
+        # Check if act_type is a string or a callable function
+        if isinstance(act_type, str):
+            assert act_type in ['ReLU', 'GeLU', 'Quad', 'Id'], f"Invalid activation type: {act_type}"
+        elif not callable(act_type):
+            raise ValueError("act_type must be either a string ('ReLU', 'GeLU', 'Quad', 'Id') or a callable function")
+        
         fourier_basis, _ = get_fourier_basis(d_vocab)
-        self.register_buffer('basis', torch.tensor(fourier_basis))
+        self.register_buffer('basis', fourier_basis.clone().detach())
     
-    def quad_act(self, x):
-        return x**2
-
     def forward(self, x):
         # Linear transformation and activation
-        #x = self.hook_pre(torch.einsum('md,bpd->bpm', self.W_in @ self.basis, x))
         x = self.hook_pre(torch.einsum('md,bpd->bpm', self.W_in, x))
-        if self.act_type == 'ReLU':
+        
+        # Apply activation function - either built-in or custom
+        if callable(self.act_type):
+            # Custom activation function
+            x = self.act_type(x)
+        elif self.act_type == 'ReLU':
             x = F.relu(x)
         elif self.act_type == 'GeLU':
             x = F.gelu(x)
         elif self.act_type == "Quad":
-            x = self.quad_act(x)
+            x = torch.square(x)
         elif self.act_type == "Id":
             x = x
+            
         x = self.hook_post(x)
         # Output transformation
-        #x = torch.einsum('dm,bpm->bpd', self.basis.T @ self.W_out, x) #+ self.b_out
-        x = torch.einsum('dm,bpm->bpd', self.W_out, x) #+ self.b_out
+        x = torch.einsum('dm,bpm->bpd', self.W_out, x)
         return x
 
 class EmbedMLP(nn.Module):
-    def __init__(self, d_vocab, d_model, d_mlp, act_type, use_cache=False, use_ln=True):
+    def __init__(self, d_vocab, d_model, d_mlp, act_type, use_cache=False, use_ln=True, init_type='random', init_scale=0.1, embed_type='one_hot'):
         super().__init__()
         self.cache = {}
         self.use_cache = use_cache
+        self.init_type = init_type
 
         # Embedding layers
-        self.embed = Embed(d_vocab, d_model)
-        self.mlp = MLP(d_model, d_mlp, d_vocab, act_type, model=[self])
+        self.embed = Embed(d_vocab, d_model, embed_type=embed_type)
+        self.mlp = MLP(d_model, d_mlp, d_vocab, act_type, model=[self], init_type=init_type, init_scale=init_scale)
         # Optional layer normalization at the output
         # self.ln = LayerNorm(d_model, model=[self])
         # Unembedding layer for output logits
@@ -156,7 +192,7 @@ class EmbedMLP(nn.Module):
         # Pass input through embedding layers
         x = self.embed(x)
         # Pass input through MLP
-        x = self.mlp(x)        
+        x = self.mlp(x)  
         # Optional normalization (commented out)
         # x = self.ln(x)
         # Pass through unembedding layer
@@ -186,6 +222,7 @@ class EmbedMLP(nn.Module):
             hp.add_hook(save_hook, 'fwd')
             if incl_bwd:
                 hp.add_hook(save_hook_back, 'bwd')
+
 
 ########## Auxiliary Functions ##########
 def get_fourier_basis(p):
@@ -222,3 +259,74 @@ def get_fourier_basis(p):
     fourier_basis = torch.stack(fourier_basis, dim=0)
     
     return fourier_basis, fourier_basis_names
+
+def decide_frequencies(d_mlp, d_model, freq_num):
+    """
+    Decide frequency assignments for each neuron.
+    
+    For a weight matrix of shape (d_mlp, d_model), valid frequencies are integers 
+    in the range [1, (d_model-1)//2]. This function samples 'freq_num' unique frequencies 
+    uniformly from this range and assigns them to the neurons as equally as possible.
+    
+    Args:
+        d_mlp (int): Number of neurons (rows).
+        d_model (int): Number of columns in the weight matrix.
+        freq_num (int): Number of unique frequencies to sample.
+    
+    Returns:
+        np.ndarray: A 1D array of length d_mlp containing the frequency assigned to each neuron.
+    """
+    # Determine the maximum available frequency.
+    max_freq = (d_model - 1) // 2
+    if freq_num > max_freq:
+        raise ValueError(f"freq_num ({freq_num}) cannot exceed the number of available frequencies ({max_freq}).")
+    
+    # Sample 'freq_num' unique frequencies uniformly from 1 to max_freq.
+    freq_choices = np.random.choice(np.arange(1, max_freq + 1), size=freq_num, replace=False)
+    
+    # Assign neurons equally among the chosen frequencies.
+    # Repeat the frequency choices until we have at least d_mlp assignments.
+    repeats = (d_mlp + freq_num - 1) // freq_num  # Ceiling division.
+    freq_assignments = np.tile(freq_choices, repeats)[:d_mlp]
+    
+    # Shuffle to randomize the order of assignments.
+    np.random.shuffle(freq_assignments)
+    
+    return freq_assignments
+
+def sparse_initialization(d_mlp, d_model, freq_assignments):
+    """
+    Generate a sparse weight matrix using the provided frequency assignments.
+    
+    For each neuron (row) assigned frequency f, this function assigns Gaussian random values 
+    to columns (2*f - 1) and (2*f) of that row. All other entries remain zero.
+    
+    Args:
+        d_mlp (int): Number of neurons (rows) in the weight matrix.
+        d_model (int): Number of columns in the weight matrix.
+        freq_assignments (np.ndarray): 1D array of length d_mlp containing the frequency for each neuron.
+    
+    Returns:
+        torch.Tensor: A weight matrix of shape (d_mlp, d_model) with the sparse initialization.
+    """
+    # Create a weight matrix filled with zeros.
+    weight = torch.zeros(d_mlp, d_model)
+    
+    # For each neuron, assign Gaussian random values to the corresponding columns.
+    for i, f in enumerate(freq_assignments):
+        col1 = 2 * f - 1
+        col2 = 2 * f
+        # Check that the computed columns are within bounds.
+        if col2 < d_model:
+            vec = torch.randn(2, device=weight.device, dtype=weight.dtype)
+            # Normalize to have L2 norm = 1
+            vec = vec / torch.norm(vec, p=2)
+    
+            # Assign the two normalized components
+            weight[i, col1] = vec[0]
+            weight[i, col2] = vec[1]
+        else:
+            # This branch should not be reached if f is chosen correctly.
+            raise IndexError(f"Computed column index {col2} is out of bounds for d_model={d_model}.")
+    
+    return weight

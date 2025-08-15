@@ -16,17 +16,26 @@ cd ${SLURM_SUBMIT_DIR}
 echo ${SLURM_SUBMIT_DIR}
 echo Running on host $(hostname)
 echo Time is $(date)
-echo SLURM_NODES are $(echo ${SLURM_NODELIST})
 echo '-------------------------------'
 echo -e '\n\n'
 
 export PROCS=${SLURM_CPUS_ON_NODE}
 
 # Set the working directory
-cd /home/jh3439/Grokking
+cd /gpfs/radev/home/jh3439/module-addition-feature
 
 module load CUDA
 module load cuDNN
 module load miniconda
 conda activate envs_LARA
-python src/exp_grokk.py
+
+echo "Starting experiments..."
+echo "============================================================="
+
+cd src
+
+#python module_nn.py --init_type random --act_type ReLU --optimizer AdamW --init_scale 0.1
+python module_nn.py --init_type random --act_type ReLU --optimizer SGD --lr 0.1 --init_scale 0.01
+#python module_nn.py --init_type single-freq --act_type Quad --optimizer SGD --lr 0.1 --init_scale 0.02
+#python module_nn.py --init_type single-freq --act_type ReLU --optimizer SGD --lr 0.01 --init_scale 0.002
+#python module_nn.py --init_type random --act_type Quad --optimizer SGD --lr 0.1 --init_scale 0.1
